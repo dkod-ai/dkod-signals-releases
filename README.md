@@ -1,6 +1,6 @@
 # dkod-signals releases
 
-Binaries and the installer for the dkod-signals device scanner. No source code lives here.
+Binaries and the installer for the dkod-signals device scanner.
 
 Install (macOS, Linux):
 
