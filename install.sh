@@ -2,7 +2,7 @@
 # install.sh — download and install the dkod-signals release binary.
 #
 # What this does: detects OS/arch, downloads the matching release asset and
-# SHA256SUMS from GitHub Releases, verifies the checksum, and installs the
+# SHA256SUMS from GitHub Releases by name, verifies the checksum, and installs the
 # binary to /usr/local/bin (or $PREFIX/bin). Nothing is uploaded — this
 # script only ever talks to GitHub's release API/CDN to fetch the binary
 # itself; it never runs dkod-signals and never sends anything anywhere.
@@ -86,69 +86,93 @@ esac
 TARGET="${arch}-${os}"
 
 # --- resolve the release ------------------------------------------------------
-# The whole release payload is fetched once and reused: it carries the tag AND
-# every asset's API id, which is what `asset_id_for` needs - the API asset
-# endpoint takes an id, not a name.
-#
-# THE OLD WORDING IS NOT REPEATED HERE. It gave an access-control reason and
-# named `fetch_asset` as its authority - while that function's own comment now
-# refutes it. A correction that quotes the sentence it removes matches itself
-# forever, so the grep that should prove the claim is gone can never reach zero.
-if [ -n "${VERSION:-}" ]; then
-  RELEASE_JSON="$(curl_auth "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}")" \
-    || die "could not find release ${VERSION}"
-else
+# Only the TAG is read from the API, and only when VERSION is not given. The
+# asset list is not trusted for a public download: on v0.1.74 GitHub served a
+# by-tag view and a releases list that both showed ZERO assets for a release
+# whose files were all there and downloadable (DKO-559), and every install that
+# read the list failed. A public install therefore downloads by name from the
+# release download URL and trusts SHA256SUMS, which it verifies below.
+if [ -z "${VERSION:-}" ]; then
   log "resolving latest release..."
-  RELEASE_JSON="$(curl_auth "https://api.github.com/repos/${REPO}/releases/latest")" \
+  LATEST_JSON="$(curl_auth "https://api.github.com/repos/${REPO}/releases/latest")" \
     || die "could not reach the GitHub API for ${REPO}. Check network access to api.github.com; if you set DKOD_RELEASES_REPO to somewhere that needs credentials, export GH_TOKEN too"
-  VERSION="$(printf '%s' "$RELEASE_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  VERSION="$(printf '%s' "$LATEST_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
   [ -n "$VERSION" ] || die "could not resolve the latest release tag"
 fi
+
+# The tag goes into a URL path, so it is held to the shape of a tag.
+case "$VERSION" in
+  "" | .* | *[!A-Za-z0-9._-]*) die "unsupported release tag: ${VERSION}" ;;
+esac
 
 VERSION_NUM="${VERSION#v}"
 ASSET="dkod-signals-${VERSION_NUM}-${TARGET}.tar.gz"
 
 # --- downloading one asset ----------------------------------------------------
-# THE API ASSET ENDPOINT, USED UNCONDITIONALLY - and the reason is no longer the
-# one this comment used to give. That reason was about access control on the
-# source repository, and it stopped being true when the releases repo became
-# public. It is not restated here: a correction carrying the claim it removes
-# is a claim that survives every grep written to find it.
+# WITHOUT GH_TOKEN (every customer install; the releases repo is public): the
+# release download URL, by name. It needs no asset id, so it never reads the
+# asset list that went stale on v0.1.74.
 #
-# THE PATH STAYS ANYWAY, and the surviving reason is the better one: one code
-# path exercised on every install beats two, one of which nobody runs. It also
-# still works if DKOD_RELEASES_REPO ever points somewhere that needs a token.
-#
-# It needs the asset's numeric id rather than its name, which is what the
-# lookup below is for.
-asset_id_for() { # asset-name
+# WITH GH_TOKEN (a mirror behind an access-controlled proxy, set through
+# DKOD_RELEASES_REPO): the API asset endpoint, which is the one that honours a
+# token. It needs the asset's numeric id. The release's own `assets` array is
+# read first, and when it lacks the asset the release's assets endpoint
+# (`assets_url`, /releases/{id}/assets) is asked instead, because that endpoint
+# stayed correct while the by-tag view did not.
+RELEASE_JSON=""
+ASSETS_JSON=""
+
+load_release() {
+  [ -n "$RELEASE_JSON" ] && return 0
+  RELEASE_JSON="$(curl_auth "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}")" \
+    || die "could not find release ${VERSION}"
+}
+
+asset_id_in() { # json asset-name
   # Flattens the payload, normalises "key": "value" to "key":"value" so the
   # match does not depend on the API's pretty-printing, splits on "{" so each
   # asset object is one line, and reads the id out of that object's own API URL.
   # Matching the /releases/assets/<id> URL rather than a bare "id" field is what
   # stops this picking up the release id, the uploader id, or any other number.
-  printf '%s' "$RELEASE_JSON" \
+  printf '%s' "$1" \
     | tr -d '\n' \
     | sed 's/"[[:space:]]*:[[:space:]]*"/":"/g' \
     | tr '{' '\n' \
-    | grep -F "\"name\":\"$1\"" \
+    | grep -F "\"name\":\"$2\"" \
     | head -n 1 \
     | sed -E 's#.*/releases/assets/([0-9]+)".*#\1#'
 }
 
+asset_id_for() { # asset-name
+  load_release
+  _found="$(asset_id_in "$RELEASE_JSON" "$1")"
+  if [ -z "$_found" ]; then
+    if [ -z "$ASSETS_JSON" ]; then
+      _assets_url="$(printf '%s' "$RELEASE_JSON" | tr -d '\n' \
+        | sed 's/"[[:space:]]*:[[:space:]]*"/":"/g' \
+        | grep -o '"assets_url":"https://api.github.com/[^"]*/releases/[0-9]*/assets"' \
+        | head -n 1 | sed -E 's/^"assets_url":"(.*)"$/\1/')" || true
+      [ -n "$_assets_url" ] || return 0
+      ASSETS_JSON="$(curl_auth "${_assets_url}?per_page=100")" || return 0
+    fi
+    _found="$(asset_id_in "$ASSETS_JSON" "$1")"
+  fi
+  printf '%s' "$_found"
+}
+
 fetch_asset() { # asset-name dest
   _name="$1"; _dest="$2"
+  if [ -z "${GH_TOKEN:-}" ]; then
+    curl -fsSL -o "$_dest" "https://github.com/${REPO}/releases/download/${VERSION}/${_name}" \
+      || die "could not download ${_name} from release ${VERSION} (does it build for ${TARGET}?)"
+    return 0
+  fi
   _id="$(asset_id_for "$_name")"
   [ -n "$_id" ] || die "release ${VERSION} has no asset named ${_name} (does it build for ${TARGET}?)"
   # --location is required: the API answers with a redirect to storage, and the
   # Authorization header is deliberately not resent to that host by curl.
-  if [ -n "${GH_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
-      -o "$_dest" "https://api.github.com/repos/${REPO}/releases/assets/${_id}"
-  else
-    curl -fsSL -H "Accept: application/octet-stream" \
-      -o "$_dest" "https://api.github.com/repos/${REPO}/releases/assets/${_id}"
-  fi
+  curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+    -o "$_dest" "https://api.github.com/repos/${REPO}/releases/assets/${_id}"
 }
 
 log "installing dkod-signals ${VERSION} for ${TARGET}"
